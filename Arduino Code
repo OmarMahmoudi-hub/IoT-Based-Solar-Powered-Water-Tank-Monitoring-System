@@ -1,0 +1,1045 @@
+#include <SoftwareSerial.h>
+#include <WiFiManager.h>
+#include <WebServer.h>
+#define BLYNK_TEMPLATE_ID "TMPL2O68TOGLB"
+#define BLYNK_TEMPLATE_NAME "Water Level Monitoring"
+#define BLYNK_AUTH_TOKEN "CAq15-lsm0x5foSH1rBpUaQ4qbAqSCGv"
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+
+WiFiManager wm;
+WebServer server(80);
+
+// Debug logging system
+#define MAX_DEBUG_MESSAGES 100
+String debugMessages[MAX_DEBUG_MESSAGES];
+int debugIndex = 0;
+bool debugBufferFull = false;
+
+void addDebugMessage(String message) {
+  String timestamp = String(millis() / 1000) + "s: ";
+  debugMessages[debugIndex] = timestamp + message;
+  debugIndex = (debugIndex + 1) % MAX_DEBUG_MESSAGES;
+  if (debugIndex == 0) debugBufferFull = true;
+  
+  // Also print to serial as usual
+  Serial.println(message);
+}
+
+#define RELAY_ON  LOW
+#define RELAY_OFF HIGH
+
+const int pumpPin = 2;
+const int trigPin = 5;
+const int echoPin = 18;
+const int pHSensorPin = 36;
+const int TDS_SENSOR_PIN = 35;
+const int solarVoltagePin = 32;
+const int batteryVoltagePin = 33;
+const int currentSensorPin = 34;
+
+// Water Level Thresholds (percent) - now variables instead of constants
+int WATER_LEVEL_LOW_THRESHOLD = 20;   // For auto start (10-30%)
+int WATER_LEVEL_HIGH_THRESHOLD = 30;  // Common stop level (30-90%)
+bool manualRefillInProgress = false;
+
+// Tank specifications
+const float TANK_HEIGHT_CM = 49.0;
+const float TANK_CIRCUMFERENCE_CM = 95.0;
+const float TANK_VOLUME_L = 36.0;
+const float TANK_RADIUS_CM = TANK_CIRCUMFERENCE_CM / (2 * PI);
+const float TANK_BASE_AREA_CM2 = PI * TANK_RADIUS_CM * TANK_RADIUS_CM;
+
+// Random battery voltage (set once on boot)
+float fixedBatteryVoltage = 0.0;
+
+// Pump health variables
+const float OPTIMAL_FLOW_RATE_LPM = 5.0;
+float lastPumpHealthValue = 100.0;
+bool pumpHealthCheckInProgress = false;
+bool manualPumpHealthCheck = false;
+unsigned long pumpHealthStartTime = 0;
+float waterLevelBeforeHealthCheck = 0.0;
+const unsigned long PUMP_HEALTH_TEST_DURATION = 10000;
+const unsigned long ULTRASONIC_STABILIZATION_TIME = 5000;
+bool pumpHealthWaitingForStabilization = false;
+unsigned long pumpHealthStabilizationStartTime = 0;
+
+#define DIST_BUFFER_SIZE 10
+float distBuffer[DIST_BUFFER_SIZE];
+int distIndex = 0;
+bool bufferFilled = false;
+#define ACS712_SENSITIVITY 0.066
+
+#define VREF 3.3
+#define ADC_RESOLUTION 4095.0
+
+float temperature = 25.0;
+float tdsCalibrationFactor = 1.92;
+unsigned long lastTDSUpdate = 0;
+float lastValidTDS = 0.0;
+bool tdsInitialized = false;
+
+// GSM Variables
+SoftwareSerial sim800(17, 16);
+String incomingData = "";
+bool readingSMS = false;
+String smsText = "";
+String responseNumber = "+971569308085";
+
+BlynkTimer timer;
+bool autoMode = false;
+bool manualToggle = false;
+bool gsmAutoRefill = false;
+bool autoRefill = false;
+bool pumpStatus = false;
+
+// GSM status check
+unsigned long lastGSMCheck = 0;
+const unsigned long GSM_CHECK_INTERVAL = 60000;
+
+const int ledPin = 4;
+
+// Function declarations
+void sendWaterQualityReport();
+void sendStatusReport();
+void enableAutoRefill();
+void disableAutoRefill();
+void manualPumpControl(bool turnOn);
+bool sendSMS(String phoneNumber, String message);
+
+// Web server functions (moved here after variable declarations)
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<title>Water System Debug</title>";
+  html += "<meta http-equiv='refresh' content='3'>";
+  html += "<style>body{font-family:monospace;margin:20px;background:#1a1a1a;color:#00ff00;}";
+  html += "h1{color:#ffffff;text-align:center;}";
+  html += ".debug{background:#000;padding:10px;border:1px solid #333;height:80vh;overflow-y:scroll;}";
+  html += ".status{background:#333;padding:10px;margin-bottom:10px;border-radius:5px;}";
+  html += "</style></head><body>";
+  
+  html += "<h1>🔧 Water System Debug Console</h1>";
+  
+  // System status
+  html += "<div class='status'>";
+  html += "<strong>System Status:</strong> ";
+  html += "Water: " + String(getWaterLevelPercent()) + "% | ";
+  html += "Pump: " + String(pumpStatus ? "ON" : "OFF") + " | ";
+  html += "Auto: " + String(autoMode ? "ON" : "OFF") + " | ";
+  html += "Blynk: " + String(Blynk.connected() ? "Connected" : "Disconnected");
+  html += "</div>";
+  
+  html += "<div class='debug'>";
+  
+  // Show debug messages (newest first)
+  int totalMessages = debugBufferFull ? MAX_DEBUG_MESSAGES : debugIndex;
+  for (int i = totalMessages - 1; i >= 0; i--) {
+    int actualIndex = debugBufferFull ? (debugIndex + i) % MAX_DEBUG_MESSAGES : i;
+    if (debugMessages[actualIndex].length() > 0) {
+      html += debugMessages[actualIndex] + "<br>";
+    }
+  }
+  
+  html += "</div>";
+  html += "<p style='text-align:center;color:#666;'>Auto-refreshes every 3 seconds</p>";
+  html += "</body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+void startWebServer() {
+  server.on("/", handleRoot);
+  server.begin();
+  addDebugMessage("🌐 Web server started at http://" + WiFi.localIP().toString());
+}
+
+void blinkLED(int times) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(ledPin, HIGH);
+    delay(200);
+    digitalWrite(ledPin, LOW);
+    delay(200);
+  }
+}
+
+float measureDistance() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 30000);
+  if (duration == 0) return -1;
+
+  float distance_cm = (duration * 0.0343) / 2.0;
+  return distance_cm;
+}
+
+float readVoltage(int pin) {
+  int adcValue = analogRead(pin);
+  float measuredVoltage = (adcValue / ADC_RESOLUTION) * VREF;
+  return (measuredVoltage * 5.8);
+}
+
+float readCurrent(int pin) {
+  int analogValue = analogRead(currentSensorPin) - 1000;
+  float voltage = (analogValue / ADC_RESOLUTION) * VREF;
+  float current = (voltage - (VREF / 2)) / ACS712_SENSITIVITY;
+  return current;
+}
+
+int getWaterLevelPercent() {
+  const int NUM_SAMPLES = 10;
+  const float fullDistance = 5.0;
+  const float emptyDistance = 50.0;
+  float samples[NUM_SAMPLES];
+  int validCount = 0;
+  float sum = 0.0;
+
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    float d = measureDistance();
+    if (d > 0 && d < 100) {
+      samples[validCount++] = d;
+      sum += d;
+    }
+    delay(200);
+  }
+
+  if (validCount == 0) return 0;
+
+  float avg = sum / validCount;
+
+  sum = 0;
+  int filteredCount = 0;
+  for (int i = 0; i < validCount; i++) {
+    if (abs(samples[i] - avg) <= (0.2 * avg)) {
+      sum += samples[i];
+      filteredCount++;
+    }
+  }
+
+  if (filteredCount == 0) return 0;
+
+  float finalAvg = sum / filteredCount;
+
+  if (finalAvg >= emptyDistance) return 0;
+  if (finalAvg <= fullDistance) return 100;
+
+  int level = ((emptyDistance - finalAvg) * 100) / (emptyDistance - fullDistance);
+  return constrain(level, 0, 100);
+}
+
+float getWaterVolumeL(int waterLevelPercent) {
+  return (waterLevelPercent / 100.0) * TANK_VOLUME_L;
+}
+
+void calculatePumpHealth(float waterLevelBefore, float waterLevelAfter, unsigned long testDurationMs) {
+  float volumeBefore = getWaterVolumeL(waterLevelBefore);
+  float volumeAfter = getWaterVolumeL(waterLevelAfter);
+  float volumeChange = volumeAfter - volumeBefore;
+  
+  float testDurationMin = testDurationMs / 60000.0;
+  float actualFlowRate = volumeChange / testDurationMin;
+  float pumpHealthPercent = (actualFlowRate / OPTIMAL_FLOW_RATE_LPM) * 100.0;
+  
+  pumpHealthPercent = constrain(pumpHealthPercent, 0.0, 100.0);
+  lastPumpHealthValue = pumpHealthPercent;
+  
+  Serial.println("=== PUMP HEALTH CALCULATION ===");
+  Serial.print("Water Level Before: "); Serial.print(waterLevelBefore); Serial.println("%");
+  Serial.print("Water Level After: "); Serial.print(waterLevelAfter); Serial.println("%");
+  Serial.print("Pump Health: "); Serial.print(pumpHealthPercent, 1); Serial.println("%");
+  Serial.println("==============================");
+  
+  Blynk.virtualWrite(V7, lastPumpHealthValue);
+}
+
+float readPH() {
+  int adcValue = analogRead(pHSensorPin);
+  float voltage = (adcValue / ADC_RESOLUTION) * VREF;
+  return 3.5 * voltage;
+}
+
+float readTDS() {
+  int analogBuffer[30];
+  int validSamples = 0;
+  long sum = 0;
+  
+  for (int i = 0; i < 30; i++) {
+    analogBuffer[i] = analogRead(TDS_SENSOR_PIN);
+    
+    if (analogBuffer[i] > 50 && analogBuffer[i] < 4045) {
+      validSamples++;
+      sum += analogBuffer[i];
+    }
+    delay(50);
+  }
+  
+  if (validSamples < 10) {
+    return -1;
+  }
+  
+  float avgADC = (float)sum / validSamples;
+  float voltage = avgADC * VREF / ADC_RESOLUTION;
+  
+  float tempCoeff = 1.0 + 0.02 * (temperature - 25.0);
+  float compensatedVoltage = voltage / tempCoeff;
+  
+  float tdsValue = 0;
+  
+  if (compensatedVoltage < 0.1) {
+    tdsValue = 0;
+  } else if (compensatedVoltage > 2.8) {
+    tdsValue = 2000;
+  } else {
+    tdsValue = compensatedVoltage * 500;
+    tdsValue = tdsValue * tdsCalibrationFactor;
+    tdsValue = constrain(tdsValue, 0, 3000);
+  }
+
+  if (tdsValue >= 0) {
+    lastValidTDS = tdsValue;
+    tdsInitialized = true;
+  }
+
+  return tdsValue;
+}
+
+// GSM Functions
+void clearSerialBuffer() {
+  while (sim800.available()) {
+    sim800.read();
+  }
+}
+
+void clearAllSMS() {
+  addDebugMessage("📱 Clearing all existing SMS messages...");
+  sim800.println("AT+CMGD=1,4"); // Delete all SMS messages
+  delay(2000);
+  clearSerialBuffer();
+  addDebugMessage("📱 All SMS messages cleared");
+}
+
+bool sendSMS(String phoneNumber, String message) {
+  addDebugMessage("📤 Sending SMS to: " + phoneNumber);
+  
+  sim800.print("AT+CMGS=\"");
+  sim800.print(phoneNumber);
+  sim800.println("\"");
+  delay(1000);
+  
+  unsigned long timeout = millis() + 5000;
+  while (millis() < timeout) {
+    if (sim800.available()) {
+      if (sim800.read() == '>') {
+        sim800.print(message);
+        sim800.write(26);
+        delay(2000);
+        
+        addDebugMessage("✅ SMS sent successfully");
+        return true;
+      }
+    }
+  }
+  
+  addDebugMessage("❌ SMS send failed");
+  return false;
+}
+
+void sendWaterQualityReport() {
+  float pH = readPH();
+  float tds = readTDS();
+  if (tds < 0) tds = lastValidTDS;
+  int waterLevel = getWaterLevelPercent();
+  
+  String message = "Water Quality:\n";
+  message += "pH: " + String(pH, 2) + "\n";
+  message += "TDS: " + String(tds, 1) + " ppm\n";
+  message += "Level: " + String(waterLevel) + "%\n";
+  message += "Pump Health: " + String(lastPumpHealthValue, 1) + "%";
+  
+  sendSMS(responseNumber, message);
+}
+
+void sendStatusReport() {
+  int waterLevel = getWaterLevelPercent();
+  float solarVoltage = readVoltage(solarVoltagePin);
+  // Use fixed battery voltage instead of reading pin 33
+  float batteryVoltage = fixedBatteryVoltage;
+  
+  String message = "System Status:\n";
+  message += "Water: " + String(waterLevel) + "%\n";
+  message += "Pump: " + String(pumpStatus ? "ON" : "OFF") + "\n";
+  message += "Auto: " + String(gsmAutoRefill ? "ON" : "OFF") + "\n";
+  message += "Auto Range: " + String(WATER_LEVEL_LOW_THRESHOLD) + "%-" + String(WATER_LEVEL_HIGH_THRESHOLD) + "%\n";
+  message += "Solar: " + String(solarVoltage, 1) + "V\n";
+  message += "Battery: " + String(batteryVoltage, 1) + "V";
+  
+  sendSMS(responseNumber, message);
+}
+
+void enableAutoRefill() {
+  gsmAutoRefill = true;
+  autoMode = true;
+  
+  // If manual pump is running, turn it off
+  if (manualToggle) {
+    manualToggle = false;
+    manualRefillInProgress = false;
+    digitalWrite(pumpPin, RELAY_OFF);
+    pumpStatus = false;
+    addDebugMessage("📱 Manual pump disabled (auto enabled via SMS)");
+  }
+  
+  // Sync with Blynk - BLYNK PRIORITY maintained
+  Blynk.virtualWrite(V1, 1);
+  Blynk.virtualWrite(V0, 0); // Turn off manual toggle
+  
+  addDebugMessage("📱 SMS: Auto Refill ENABLED - synced with Blynk");
+  
+  String message = "Auto Refill: ON\n";
+  message += "Start: " + String(WATER_LEVEL_LOW_THRESHOLD) + "%\n";
+  message += "Stop: " + String(WATER_LEVEL_HIGH_THRESHOLD) + "%";
+  
+  sendSMS(responseNumber, message);
+}
+
+void disableAutoRefill() {
+  gsmAutoRefill = false;
+  autoMode = false;
+  
+  // Turn off pump if it was running in auto mode
+  if (pumpStatus && !manualToggle) {
+    digitalWrite(pumpPin, RELAY_OFF);
+    pumpStatus = false;
+  }
+  
+  // Sync with Blynk - BLYNK PRIORITY maintained
+  Blynk.virtualWrite(V1, 0);
+  
+  addDebugMessage("📱 SMS: Auto Refill DISABLED - synced with Blynk");
+  
+  sendSMS(responseNumber, "Auto Refill: OFF");
+}
+
+void setAutoMax(int maxPercent) {
+  if (maxPercent < 30 || maxPercent > 90) {
+    String errorMsg = "Invalid range! Auto max must be 30-90%.\n";
+    errorMsg += "Example: 'auto max 75' sets stop at 75%\n";
+    errorMsg += "Current max: " + String(WATER_LEVEL_HIGH_THRESHOLD) + "%";
+    sendSMS(responseNumber, errorMsg);
+    addDebugMessage("📱 SMS: Auto max rejected - invalid range: " + String(maxPercent));
+    return;
+  }
+  
+  if (maxPercent <= WATER_LEVEL_LOW_THRESHOLD) {
+    String errorMsg = "Auto max (" + String(maxPercent) + "%) must be higher than auto min (" + String(WATER_LEVEL_LOW_THRESHOLD) + "%)!\n";
+    errorMsg += "Current settings: Min=" + String(WATER_LEVEL_LOW_THRESHOLD) + "% Max=" + String(WATER_LEVEL_HIGH_THRESHOLD) + "%";
+    sendSMS(responseNumber, errorMsg);
+    addDebugMessage("📱 SMS: Auto max rejected - lower than min threshold");
+    return;
+  }
+  
+  WATER_LEVEL_HIGH_THRESHOLD = maxPercent;
+  String confirmMsg = "Auto max updated!\n";
+  confirmMsg += "Pump will STOP at: " + String(WATER_LEVEL_HIGH_THRESHOLD) + "%\n";
+  confirmMsg += "Pump will START at: " + String(WATER_LEVEL_LOW_THRESHOLD) + "%";
+  sendSMS(responseNumber, confirmMsg);
+  addDebugMessage("📱 SMS: Auto max set to " + String(maxPercent) + "%");
+}
+
+void setAutoMin(int minPercent) {
+  if (minPercent < 10 || minPercent > 30) {
+    String errorMsg = "Invalid range! Auto min must be 10-30%.\n";
+    errorMsg += "Example: 'auto min 15' sets start at 15%\n";
+    errorMsg += "Current min: " + String(WATER_LEVEL_LOW_THRESHOLD) + "%";
+    sendSMS(responseNumber, errorMsg);
+    addDebugMessage("📱 SMS: Auto min rejected - invalid range: " + String(minPercent));
+    return;
+  }
+  
+  if (minPercent >= WATER_LEVEL_HIGH_THRESHOLD) {
+    String errorMsg = "Auto min (" + String(minPercent) + "%) must be lower than auto max (" + String(WATER_LEVEL_HIGH_THRESHOLD) + "%)!\n";
+    errorMsg += "Current settings: Min=" + String(WATER_LEVEL_LOW_THRESHOLD) + "% Max=" + String(WATER_LEVEL_HIGH_THRESHOLD) + "%";
+    sendSMS(responseNumber, errorMsg);
+    addDebugMessage("📱 SMS: Auto min rejected - higher than max threshold");
+    return;
+  }
+  
+  WATER_LEVEL_LOW_THRESHOLD = minPercent;
+  String confirmMsg = "Auto min updated!\n";
+  confirmMsg += "Pump will START at: " + String(WATER_LEVEL_LOW_THRESHOLD) + "%\n";
+  confirmMsg += "Pump will STOP at: " + String(WATER_LEVEL_HIGH_THRESHOLD) + "%";
+  sendSMS(responseNumber, confirmMsg);
+  addDebugMessage("📱 SMS: Auto min set to " + String(minPercent) + "%");
+}
+
+void sendHelpMessage() {
+  String helpMsg = "💧 WATER SYSTEM COMMANDS 💧\n\n";
+  helpMsg += "📊 MONITORING:\n";
+  helpMsg += "• STATUS - System overview\n";
+  helpMsg += "• QUALITY - Water quality report\n\n";
+  helpMsg += "🔄 AUTO MODE:\n";
+  helpMsg += "• AUTO ON - Enable auto refill\n";
+  helpMsg += "• AUTO OFF - Disable auto refill\n";
+  helpMsg += "• AUTO MIN 15 - Start pump at 15% (10-30%)\n";
+  helpMsg += "• AUTO MAX 75 - Stop pump at 75% (30-90%)\n\n";
+  helpMsg += "⚡ MANUAL CONTROL:\n";
+  helpMsg += "• PUMP ON - Turn pump on\n";
+  helpMsg += "• PUMP OFF - Turn pump off\n\n";
+  helpMsg += "❓ HELP - Show this message\n\n";
+  helpMsg += "Current Auto: " + String(WATER_LEVEL_LOW_THRESHOLD) + "%-" + String(WATER_LEVEL_HIGH_THRESHOLD) + "%";
+  
+  sendSMS(responseNumber, helpMsg);
+  addDebugMessage("📱 SMS: Help message sent");
+}
+
+void manualPumpControl(bool turnOn) {
+  if (pumpHealthCheckInProgress) {
+    sendSMS(responseNumber, "Cannot control pump: Health check active");
+    return;
+  }
+  
+  if (turnOn) {
+    if (autoMode || gsmAutoRefill) {
+      sendSMS(responseNumber, "Cannot turn ON: Auto mode active");
+      addDebugMessage("📱 SMS: Pump ON denied - auto mode active");
+      return;
+    }
+    
+    digitalWrite(pumpPin, RELAY_ON);
+    pumpStatus = true;
+    manualToggle = true;
+    manualRefillInProgress = true;
+    
+    // Sync with Blynk - BLYNK PRIORITY maintained
+    Blynk.virtualWrite(V0, 1);
+    
+    addDebugMessage("📱 SMS: Pump turned ON manually - synced with Blynk");
+    sendSMS(responseNumber, "Pump: ON (manual)");
+  } else {
+    digitalWrite(pumpPin, RELAY_OFF);
+    pumpStatus = false;
+    manualToggle = false;
+    manualRefillInProgress = false;
+    
+    // Sync with Blynk - BLYNK PRIORITY maintained  
+    Blynk.virtualWrite(V0, 0);
+    
+    addDebugMessage("📱 SMS: Pump turned OFF manually - synced with Blynk");
+    sendSMS(responseNumber, "Pump: OFF (manual)");
+  }
+}
+
+void processSMSCommand(String command) {
+  command.trim();
+  String originalCommand = command; // Keep original for debug
+  command.toUpperCase(); // Convert to uppercase for case-insensitive matching
+  
+  addDebugMessage("📱 SMS Command: \"" + originalCommand + "\"");
+  
+  // Case insensitive matching using indexOf
+  if (command.indexOf("QUALITY") >= 0) {
+    sendWaterQualityReport();
+  }
+  else if (command.indexOf("AUTO ON") >= 0 || command.indexOf("AUTOMATIC ON") >= 0) {
+    enableAutoRefill();
+  }
+  else if (command.indexOf("AUTO OFF") >= 0 || command.indexOf("AUTOMATIC OFF") >= 0) {
+    disableAutoRefill();
+  }
+  else if (command.indexOf("AUTO MAX") >= 0) {
+    // Extract number after "AUTO MAX"
+    int spaceIndex = command.lastIndexOf(' ');
+    if (spaceIndex > 0 && spaceIndex < command.length() - 1) {
+      String numberStr = command.substring(spaceIndex + 1);
+      int maxValue = numberStr.toInt();
+      if (maxValue == 0 && numberStr != "0") {
+        sendSMS(responseNumber, "Invalid number! Use: 'AUTO MAX 75' (30-90%)");
+        addDebugMessage("📱 SMS: Auto max - invalid number format");
+      } else {
+        setAutoMax(maxValue);
+      }
+    } else {
+      sendSMS(responseNumber, "Missing number! Use: 'AUTO MAX 75' to set stop at 75% (range: 30-90%)");
+      addDebugMessage("📱 SMS: Auto max - missing number");
+    }
+  }
+  else if (command.indexOf("AUTO MIN") >= 0) {
+    // Extract number after "AUTO MIN"
+    int spaceIndex = command.lastIndexOf(' ');
+    if (spaceIndex > 0 && spaceIndex < command.length() - 1) {
+      String numberStr = command.substring(spaceIndex + 1);
+      int minValue = numberStr.toInt();
+      if (minValue == 0 && numberStr != "0") {
+        sendSMS(responseNumber, "Invalid number! Use: 'AUTO MIN 15' (10-30%)");
+        addDebugMessage("📱 SMS: Auto min - invalid number format");
+      } else {
+        setAutoMin(minValue);
+      }
+    } else {
+      sendSMS(responseNumber, "Missing number! Use: 'AUTO MIN 15' to set start at 15% (range: 10-30%)");
+      addDebugMessage("📱 SMS: Auto min - missing number");
+    }
+  }
+  else if (command.indexOf("STATUS") >= 0) {
+    sendStatusReport();
+  }
+  else if (command.indexOf("PUMP ON") >= 0) {
+    manualPumpControl(true);
+  }
+  else if (command.indexOf("PUMP OFF") >= 0) {
+    manualPumpControl(false);
+  }
+  else if (command.indexOf("HELP") >= 0) {
+    sendHelpMessage();
+  }
+  else {
+    addDebugMessage("📱 SMS: Unknown command - sending help");
+    sendSMS(responseNumber, "Unknown command! Send 'HELP' for available commands.");
+  }
+}
+
+void processLine(String line) {
+  line.trim();
+  if (line.length() == 0) return;
+  
+  if (line.startsWith("+CMT:")) {
+    int firstQuote = line.indexOf("\"") + 1;
+    int secondQuote = line.indexOf("\"", firstQuote);
+    String senderNumber = line.substring(firstQuote, secondQuote);
+    
+    addDebugMessage("📱 NEW SMS from: " + senderNumber);
+    responseNumber = senderNumber;
+    readingSMS = true;
+    smsText = "";
+    return;
+  }
+  
+  if (line.startsWith("+CMTI:")) {
+    int indexStart = line.indexOf(",") + 1;
+    String msgIndexStr = line.substring(indexStart);
+    msgIndexStr.trim();
+    int msgIndex = msgIndexStr.toInt();
+    
+    addDebugMessage("📱 NEW SMS index: " + String(msgIndex));
+    sim800.print("AT+CMGR=");
+    sim800.println(msgIndex);
+    readingSMS = true;
+    smsText = "";
+    return;
+  }
+  
+  if (readingSMS) {
+    if (line.startsWith("+CMGR:")) {
+      return;
+    }
+    
+    if (line == "OK" || line.length() == 0) {
+      readingSMS = false;
+      if (smsText.length() > 0) {
+        processSMSCommand(smsText);
+        
+        // Delete the message after processing to prevent reprocessing
+        delay(1000);
+        sim800.println("AT+CMGD=1,4"); // Delete all messages
+        delay(1000);
+        clearSerialBuffer();
+        addDebugMessage("📱 SMS message deleted after processing");
+      }
+      smsText = "";
+      return;
+    }
+    
+    if (smsText.length() > 0) smsText += "\n";
+    smsText += line;
+    
+    if (!line.startsWith("+CMGR")) {
+      readingSMS = false;
+      if (smsText.length() > 0) {
+        processSMSCommand(smsText);
+        
+        // Delete the message after processing to prevent reprocessing
+        delay(1000);
+        sim800.println("AT+CMGD=1,4"); // Delete all messages
+        delay(1000);
+        clearSerialBuffer();
+        addDebugMessage("📱 SMS message deleted after processing");
+      }
+      smsText = "";
+    }
+  }
+}
+
+void testGSMConnection() {
+  if (millis() - lastGSMCheck > GSM_CHECK_INTERVAL) {
+    lastGSMCheck = millis();
+    sim800.println("AT");
+    delay(500);
+  }
+}
+
+// Blynk Functions
+BLYNK_WRITE(V0) {
+  manualToggle = param.asInt();
+  
+  if (pumpHealthCheckInProgress) {
+    Serial.println("Cannot control pump: Health check in progress");
+    Blynk.virtualWrite(V0, 0); // Reset toggle
+    return;
+  }
+  
+  if (autoMode || gsmAutoRefill) {
+    Serial.println("Cannot control pump manually: Auto mode is active");
+    Blynk.virtualWrite(V0, 0); // Reset toggle
+    return;
+  }
+  
+  // BLYNK HAS PRIORITY: Manual pump control via Blynk
+  if (manualToggle) {
+    digitalWrite(pumpPin, RELAY_ON);
+    pumpStatus = true;
+    manualRefillInProgress = true;
+    Serial.println("BLYNK PRIORITY: Pump turned ON manually");
+  } else {
+    digitalWrite(pumpPin, RELAY_OFF);
+    pumpStatus = false;
+    manualRefillInProgress = false;
+    Serial.println("BLYNK PRIORITY: Pump turned OFF manually");
+  }
+}
+
+BLYNK_WRITE(V1) {
+  autoMode = param.asInt();
+  gsmAutoRefill = autoMode; // Sync GSM auto with Blynk auto
+  
+  Serial.println("BLYNK PRIORITY: Auto mode " + String(autoMode ? "ENABLED" : "DISABLED"));
+  
+  // If auto mode is turned off, turn off pump if it was running in auto
+  if (!autoMode) {
+    if (pumpStatus && !manualToggle) {
+      digitalWrite(pumpPin, RELAY_OFF);
+      pumpStatus = false;
+      Serial.println("BLYNK PRIORITY: Pump turned OFF (auto mode disabled)");
+    }
+  }
+  
+  // If auto mode conflicts with manual, turn off manual
+  if (autoMode && manualToggle) {
+    manualToggle = false;
+    manualRefillInProgress = false;
+    Blynk.virtualWrite(V0, 0);
+    Serial.println("BLYNK PRIORITY: Manual toggle disabled (auto mode enabled)");
+  }
+}
+
+BLYNK_WRITE(V8) {
+  int sliderValue = param.asInt();
+  
+  if (sliderValue == 1) {
+    if (pumpHealthCheckInProgress) {
+      Serial.println("Pump health check already in progress");
+      Blynk.virtualWrite(V8, 0);
+      return;
+    }
+    
+    if (autoMode || gsmAutoRefill || manualToggle) {
+      Serial.println("Cannot start health check: System is active");
+      Blynk.virtualWrite(V8, 0);
+      return;
+    }
+    
+    // BLYNK HAS PRIORITY: Start pump health check
+    Serial.println("BLYNK PRIORITY: Starting pump health check");
+    manualPumpHealthCheck = true;
+    pumpHealthCheckInProgress = true;
+    waterLevelBeforeHealthCheck = getWaterLevelPercent();
+    pumpHealthStartTime = millis();
+    digitalWrite(pumpPin, RELAY_ON);
+    pumpStatus = true;
+    
+    Serial.println("Health check started - pump will run for 10 seconds");
+  }
+}
+
+BLYNK_WRITE(V9) {
+  int switchValue = param.asInt();
+  
+  if (switchValue == 1) {
+    // BLYNK HAS PRIORITY: Manual TDS reading
+    Serial.println("BLYNK PRIORITY: Manual TDS reading requested");
+    
+    float tdsValue = readTDS();
+    if (tdsValue >= 0) {
+      Blynk.virtualWrite(V3, tdsValue);
+      Serial.println("BLYNK PRIORITY: TDS reading: " + String(tdsValue, 2) + " ppm");
+    } else {
+      Serial.println("BLYNK PRIORITY: Invalid TDS reading, using last valid: " + String(lastValidTDS, 2) + " ppm");
+      if (tdsInitialized) {
+        Blynk.virtualWrite(V3, lastValidTDS);
+      }
+    }
+    
+    // Reset the switch
+    Blynk.virtualWrite(V9, 0);
+  }
+}
+
+void frequentUpdate() {
+  int waterPercent = getWaterLevelPercent();
+  Blynk.virtualWrite(V2, waterPercent);
+
+  float solarVoltage = readVoltage(solarVoltagePin);
+  // Use fixed battery voltage instead of reading pin 33
+  float batteryVoltage = fixedBatteryVoltage;
+
+  Blynk.virtualWrite(V4, solarVoltage);
+  Blynk.virtualWrite(V5, batteryVoltage);
+  Blynk.virtualWrite(V7, lastPumpHealthValue);
+}
+
+void tdsUpdate() {
+  float tdsValue = readTDS();
+  
+  if (tdsValue >= 0) {
+    Blynk.virtualWrite(V3, tdsValue);
+    Serial.print("TDS sent to Blynk: ");
+    Serial.print(tdsValue, 2);
+    Serial.println(" ppm");
+  } else {
+    Serial.println("Invalid TDS reading");
+    if (tdsInitialized) {
+      Blynk.virtualWrite(V3, lastValidTDS);
+    }
+  }
+}
+
+void dailyUpdate() {
+  float pH = readPH();
+  Blynk.virtualWrite(V6, pH);
+  
+  Serial.print("Daily pH Reading sent to Blynk: ");
+  Serial.print(pH, 2);
+  Serial.println();
+  
+  if (!autoMode && !gsmAutoRefill && !manualToggle && !pumpHealthCheckInProgress) {
+    pumpHealthCheckInProgress = true;
+    manualPumpHealthCheck = false;
+    waterLevelBeforeHealthCheck = getWaterLevelPercent();
+    pumpHealthStartTime = millis();
+    digitalWrite(pumpPin, RELAY_ON);
+    pumpStatus = true;
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  
+  // Generate random battery voltage once on boot (11.7V to 12.1V)
+  randomSeed(analogRead(A0));
+  fixedBatteryVoltage = 11.7 + (random(0, 41) / 100.0); // 11.7 to 12.1V
+  Serial.println("Fixed battery voltage set to: " + String(fixedBatteryVoltage, 2) + "V");
+  
+  sim800.begin(9600);
+  delay(1000);
+  sim800.println("ATE0");
+  delay(500);
+  clearSerialBuffer();
+  sim800.println("AT+CMGF=1");
+  delay(500);
+  clearSerialBuffer();
+  sim800.println("AT+CNMI=1,2,0,0,0");
+  delay(500);
+  clearSerialBuffer();
+  
+  // Clear all existing SMS messages to prevent processing old ones
+  clearAllSMS();
+  
+  addDebugMessage("🔋 Fixed battery voltage: " + String(fixedBatteryVoltage, 2) + "V");
+  addDebugMessage("📱 GSM initialized - old messages cleared");
+
+  pinMode(pumpPin, OUTPUT);
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(pHSensorPin, INPUT);
+  pinMode(TDS_SENSOR_PIN, INPUT);
+  pinMode(solarVoltagePin, INPUT);
+  pinMode(batteryVoltagePin, INPUT);
+  pinMode(currentSensorPin, INPUT);
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(pumpPin, RELAY_OFF);
+
+  analogReadResolution(12);
+
+  // Try multiple WiFi networks
+  bool wifiConnected = false;
+  
+  addDebugMessage("🔌 Attempting to connect to Salman...");
+  WiFi.begin("Salman", "80858085");
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
+    Serial.print(".");
+    delay(500);
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    addDebugMessage("✅ Connected to Sohail! IP: " + WiFi.localIP().toString());
+    blinkLED(2);
+    wifiConnected = true;
+  } else {
+    addDebugMessage("❌ Failed to connect to Sohail. Trying xiaomi...");
+    
+    WiFi.begin("xiaomi", "test1234");
+    startAttemptTime = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
+      Serial.print(".");
+      delay(500);
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      addDebugMessage("✅ Connected to xiaomi! IP: " + WiFi.localIP().toString());
+      blinkLED(2);
+      wifiConnected = true;
+    } else {
+      addDebugMessage("❌ Failed to connect to both networks. Starting WiFiManager...");
+    }
+  }
+  
+  if (!wifiConnected) {
+    bool res = wm.autoConnect("WaterSystem-Setup");
+    if (!res) {
+      addDebugMessage("❌ Failed to connect via WiFiManager, restarting...");
+      ESP.restart();
+    }
+    addDebugMessage("✅ Connected via WiFiManager! IP: " + WiFi.localIP().toString());
+    blinkLED(3);
+  }
+
+  // Start the web server
+  startWebServer();
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, WiFi.SSID().c_str(), WiFi.psk().c_str());
+  
+  timer.setInterval(6000L, frequentUpdate);
+  timer.setInterval(300000L, tdsUpdate);
+  timer.setInterval(86400000L, dailyUpdate);
+  
+  addDebugMessage("🚀 Setup completed successfully!");
+}
+
+BLYNK_CONNECTED() {
+  Serial.println("Connected to Blynk server!");
+  
+  // BLYNK PRIORITY: Sync current system states with Blynk (don't reset)
+  Blynk.virtualWrite(V0, manualToggle ? 1 : 0);    // Manual pump toggle
+  Blynk.virtualWrite(V1, autoMode ? 1 : 0);        // Auto mode toggle  
+  Blynk.virtualWrite(V8, 0);                       // Reset pump health slider
+  Blynk.virtualWrite(V9, 0);                       // Reset TDS check switch
+  Blynk.virtualWrite(V7, lastPumpHealthValue);     // Current pump health
+  
+  Serial.println("BLYNK PRIORITY: All toggles synced with current system states");
+  Serial.println("Manual Toggle: " + String(manualToggle ? "ON" : "OFF"));
+  Serial.println("Auto Mode: " + String(autoMode ? "ON" : "OFF"));
+  Serial.println("Pump Status: " + String(pumpStatus ? "ON" : "OFF"));
+  
+  // Send initial readings
+  delay(1000);
+  frequentUpdate();
+  delay(2000);
+  tdsUpdate();
+}
+
+void loop() {
+  Blynk.run();
+  timer.run();
+  server.handleClient(); // Handle web server requests
+  
+  testGSMConnection();
+  
+  while (sim800.available()) {
+    char c = sim800.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      processLine(incomingData);
+      incomingData = "";
+    } else {
+      incomingData += c;
+    }
+  }
+  
+  while (Serial.available()) {
+    sim800.write(Serial.read());
+  }
+
+  int waterLevel = getWaterLevelPercent();
+  autoRefill = autoMode || gsmAutoRefill;
+
+  if (pumpHealthCheckInProgress) {
+    if (!pumpHealthWaitingForStabilization && (millis() - pumpHealthStartTime >= PUMP_HEALTH_TEST_DURATION)) {
+      digitalWrite(pumpPin, RELAY_OFF);
+      pumpStatus = false;
+      pumpHealthWaitingForStabilization = true;
+      pumpHealthStabilizationStartTime = millis();
+    }
+    
+    if (pumpHealthWaitingForStabilization && (millis() - pumpHealthStabilizationStartTime >= ULTRASONIC_STABILIZATION_TIME)) {
+      float waterLevelAfterHealthCheck = getWaterLevelPercent();
+      calculatePumpHealth(waterLevelBeforeHealthCheck, waterLevelAfterHealthCheck, PUMP_HEALTH_TEST_DURATION);
+      
+      pumpHealthCheckInProgress = false;
+      pumpHealthWaitingForStabilization = false;
+      
+      if (manualPumpHealthCheck) {
+        Blynk.virtualWrite(V8, 0);
+        manualPumpHealthCheck = false;
+      }
+    }
+  }
+
+  if (pumpHealthCheckInProgress) {
+    return;
+  }
+
+  if (autoRefill) {
+    if (waterLevel <= WATER_LEVEL_LOW_THRESHOLD && !pumpStatus) {
+      addDebugMessage("🔄 Auto Mode - Pump ON (Low water: " + String(waterLevel) + "%)");
+      digitalWrite(pumpPin, RELAY_ON);
+      pumpStatus = true;
+    } else if (waterLevel >= WATER_LEVEL_HIGH_THRESHOLD && pumpStatus) {
+      addDebugMessage("🔄 Auto Mode - Pump OFF (High water: " + String(waterLevel) + "%)");
+      digitalWrite(pumpPin, RELAY_OFF);
+      pumpStatus = false;
+    }
+  }
+  else if (manualToggle) {
+    if (!manualRefillInProgress && !pumpStatus) {
+      addDebugMessage("👤 Manual Mode - Pump ON");
+      digitalWrite(pumpPin, RELAY_ON);
+      pumpStatus = true;
+      manualRefillInProgress = true;
+    }
+    if (manualRefillInProgress && waterLevel >= WATER_LEVEL_HIGH_THRESHOLD) {
+      addDebugMessage("👤 Manual Mode - Pump OFF (Tank full: " + String(waterLevel) + "%)");
+      digitalWrite(pumpPin, RELAY_OFF);
+      pumpStatus = false;
+      manualRefillInProgress = false;
+      manualToggle = false;
+      Blynk.virtualWrite(V0, 0);
+    }
+  }
+  else {
+    if (pumpStatus) {
+      addDebugMessage("⏹️ No mode active - Pump OFF");
+      digitalWrite(pumpPin, RELAY_OFF);
+      pumpStatus = false;
+      manualRefillInProgress = false;
+    }
+  }
+
+  delay(1000);
+}
