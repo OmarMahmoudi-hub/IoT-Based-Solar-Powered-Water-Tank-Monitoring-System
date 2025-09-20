@@ -1,0 +1,79 @@
+1. Required Hardware
+- ESP32 Development Board
+- SIM800L or SIM800C GSM Module
+- Ultrasonic Sensor (e.g., HC-SR04)
+- TDS Sensor
+- pH Sensor
+- Relay Module (for controlling the pump)
+- 12V Water Pump
+- Power Source (e.g., 12V battery, solar setup)
+- Jumper wires, breadboard or PCB
+- Optional: OLED Display or LED indicator
+
+2. Arduino IDE Setup
+Make sure you have the Arduino IDE installed. You can download it from:
+https://www.arduino.cc/en/software
+ Install ESP32 Board
+1. Open Arduino IDE.
+2. Go to File > Preferences.
+3. In the 'Additional Board Manager URLs' field, add:
+ https://raw.githubusercontent.com/espressif/arduino-esp32/ghpages/package_esp32_index.json
+4. Go to Tools > Board > Boards Manager.
+
+5. Search for 'ESP32' and install it.
+
+4. Required Libraries
+Install the following libraries via Library Manager (Sketch > Include Library > Manage
+Libraries):
+- Blynk (Blynk Legacy by Volodymyr Shymanskyy)
+- WiFiManager by tzapu
+- SoftwareSerial (usually built-in)
+- WebServer (comes with ESP32 core)
+- Ticker (included with ESP32 core)
+- EEPROM (for storing config, optional)
+- Any custom library for TDS or pH sensor if using advanced sensors
+5. Uploading the Code
+1. Connect your ESP32 board to your PC.
+2. Select the correct port and board from Tools.
+3. Copy and paste the code into a new Arduino sketch.
+4. Modify Wi-Fi credentials and Blynk Auth Token in the code.
+5. Click on the upload button.
+
+6. Connect the Components
+- Ultrasonic Sensor: Connect to specified trig and echo pins.
+- SIM800 Module: Connect RX/TX to ESP32 (use level shifter if needed).
+- Relay: IN pin to pump control pin, VCC and GND appropriately.
+- Sensors: Connect TDS and pH sensors to their designated analog pins.
+
+7. First Run
+- Once powered, the ESP32 will try connecting to Wi-Fi.
+- If Wi-Fi fails, WiFiManager will start; connect to its hotspot to configure.
+- Blynk will start syncing and sending data.
+- SMS commands can be sent to the GSM module to control the system.
+
+8. Common SMS Commands
+- AUTO MAX 75 – Sets automatic refill stop at 75%
+- AUTO MIN 15 – Sets automatic refill start at 15%
+- STATUS – Sends current system status
+- PUMP ON – Turns pump on manually
+- PUMP OFF – Turns pump off manually
+- HELP – Sends command list
+
+9. Blynk App Configuration
+Widget Virtual Pin Description
+Switch V0 Manual Pump Toggle
+Switch V1 Auto Mode Toggle
+Gauge V2 Water Level %
+Display V3 TDS Reading
+Display V4 Solar Voltage
+Display V5 Battery Voltage
+Display V6 pH Reading
+Display V7 Pump Health
+Switch V8 Start Pump Health Check
+Switch V9 Manual TDS Refresh
+
+10. Notes
+- Ensure your SIM card has SMS capability and sufficient balance.
+- Place ultrasonic sensor above water tank for accurate readings.
+- Blynk uses legacy tokens; consider upgrading if needed.
+- Use stable power supply to avoid GSM/ESP32 brownouts.
